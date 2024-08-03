@@ -9,5 +9,6 @@ mwtypes==0.4.0
 mwxml==0.3.4
 numpy==2.0.1
 para==0.0.8
+psutil
 referencing==0.35.1
 rpds-py==0.19.1

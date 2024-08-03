@@ -29,19 +29,24 @@ import json
 import os
 import argparse
 import numpy as np
+import gc
+import psutil
+import os.path
+import csv
 
 from utils import remove_specific_tags
 from page_counter import counter_
 from starter import table_exists
 
+DB_DIR = "db_files/"
 def get_highest_db_index():
     db_index = 1
-    while os.path.exists(f'wikipedia_{db_index}.db'):
+    while os.path.exists(DB_DIR+f'wikipedia_{db_index}.db'):
         db_index += 1
     return db_index - 1
 
 def get_connection(db_index):
-    db_path = f'wikipedia_{db_index}.db'
+    db_path = DB_DIR+ f'wikipedia_{db_index}.db'
     conn = sqlite3.connect(db_path)
     conn.execute('PRAGMA journal_mode=WAL;')
     conn.execute('PRAGMA synchronous=NORMAL;')
@@ -160,7 +165,7 @@ def validate_last_entry(file_path):
                 next_article_id = page.id
                 next_title = page.title
                 print(f"Next article to be processed: Page ID = {next_article_id}, Title = {next_title}")
-                return last_article_id == next_article_id - 1
+                return last_article_id < next_article_id
     else:
         print("No entries found in the articles table.")
         return False
@@ -197,134 +202,172 @@ def parse_dump(file_path, total_pages_file=None, db_splinter_size=10):
     conn, db_path = get_connection(db_index)
     c = conn.cursor()
     
-    dump = mwxml.Dump.from_file(open(file_path, 'rb'))
-    count = 0
-    start_time = time.time()
-    prev_time = start_time
+    # Create import_log.csv
+    if not os.path.isfile("db_files/import_log.csv"):
+        with open("db_files/import_log.csv","w", newline="") as fi:
+            writer = csv.writer(fi)
+            writer.writerow(
+                ["count", "pages_per_second", "percentage_complete", "memory in use"]
+            )
 
-    # Load total pages from JSON file
-    if total_pages_file:
-        json_path = total_pages_file
-        with open(json_path, 'r') as f:
-            total_pages = json.load(f)["total_pages"]
-    else:
-        total_pages = 0
+    with open(file_path, 'rb') as dump_file:
+        dump = mwxml.Dump.from_file(dump_file)
+        count = 0
+        start_time = time.time()
+        prev_time = start_time
+        _printing_text = ""
 
-    last_page_id = load_checkpoint()
-    skip = last_page_id is not None
-    comparison = 0.0
+        # Load total pages from JSON file
+        if total_pages_file:
+            json_path = total_pages_file
+            with open(json_path, 'r') as f:
+                total_pages = json.load(f)["total_pages"]
+        else:
+            total_pages = 0
 
-    for page in dump:
-        if skip:
-            if page.id <= last_page_id:
-                if last_page_id - page.id > 1000:
-                    if int(last_page_id - page.id) % 1000 == 0.0:
+        last_page_id = load_checkpoint()
+        skip = last_page_id is not None
+        comparison = 0.0
+
+        for page in dump:
+            if skip:
+                if page.id <= last_page_id:
+                    if last_page_id - page.id > 1000:
+                        if int(last_page_id - page.id) % 1000 == 0.0:
+                            print(f"Jumping from {page.id} to {last_page_id}\r", end="")
+                    else:
                         print(f"Jumping from {page.id} to {last_page_id}\r", end="")
+                    continue
+                skip = False
+
+                # Perform the validation check
+                if validate_last_entry(file_path):
+                    print("Validation successful: The last entry in the articles table matches the one after the skip loop.")
                 else:
-                    print(f"Jumping from {page.id} to {last_page_id}\r", end="")
-                continue
-            skip = False
+                    print("Validation failed: The last entry in the articles table does not match the one after the skip loop.")
+                    raise(Exception("Validation Error"))
 
-            # Perform the validation check
-            if validate_last_entry(file_path):
-                print("Validation successful: The last entry in the articles table matches the one after the skip loop.")
-            else:
-                print("Validation failed: The last entry in the articles table does not match the one after the skip loop.")
-                raise(Exception("Validation Error"))
+            latest_revision = None
+            for revision in page:
+                latest_revision = revision
 
-        latest_revision = None
-        for revision in page:
-            latest_revision = revision
-
-        if latest_revision:
-            title = page.title
-            content = latest_revision.text
-            if content:
-                parsed_content = mwparserfromhell.parse(content)
-                
-                # Detect categories
-                categories = [str(link.title) for link in parsed_content.filter_wikilinks() if link.title.startswith("Category:")]
-                
-                # Detect redirects
-                is_redirect = content.strip().lower().startswith("#redirect")
-
-                # Determine type
-                if is_redirect and categories:
-                    type_ = 'redirect_and_categories'
-                elif is_redirect:
-                    type_ = 'redirect'
-                elif categories:
-                    type_ = 'categories'
-                else:
-                    type_ = 'text'
-
-                # Check database size and switch to a new one if it exceeds the limit
-                comparison = get_db_size(db_path) / float(db_splinter_size * 1024 * 1024 * 1024)
-
-                while comparison > 1:  # 10 GB limit
-                    conn.commit()
-
-                    print(f"\nVacuuming the database after {count} entries...")
-                    conn.execute('VACUUM;')
-                    print("Vacuum completed.")
+            if latest_revision:
+                title = page.title
+                content = latest_revision.text
+                if content:
+                    parsed_content = mwparserfromhell.parse(content)
                     
-                    conn.close()
+                    # Detect categories
+                    categories = [str(link.title) for link in parsed_content.filter_wikilinks() if link.title.startswith("Category:")]
                     
-                    db_index += 1
-                    conn, db_path = get_connection(db_index)
-                    c = conn.cursor()
+                    # Detect redirects
+                    is_redirect = content.strip().lower().startswith("#redirect")
+
+                    # Determine type
+                    if is_redirect and categories:
+                        type_ = 'redirect_and_categories'
+                    elif is_redirect:
+                        type_ = 'redirect'
+                    elif categories:
+                        type_ = 'categories'
+                    else:
+                        type_ = 'text'
+
+                    # Check database size and switch to a new one if it exceeds the limit
                     comparison = get_db_size(db_path) / float(db_splinter_size * 1024 * 1024 * 1024)
 
-                try:
-                    c.execute('INSERT INTO articles (article_id, title, is_redirect, type) VALUES (?, ?, ?, ?)', 
-                              (page.id, title, is_redirect, type_))
-                    article_id = c.lastrowid
+                    while comparison > 1:  # 10 GB limit
+                        conn.commit()
 
-                    # Insert sections
-                    sections = parse_sections(parsed_content, is_redirect)
-                    
-                    # Create blank embedding variable with identity matrix, process this later
-                    blank_embedding = np.identity(n=3, dtype=np.float32)
-                    embedding_blob = blank_embedding.tobytes()
-                    
-                    for section_order in range(len(sections)):
-                        section_title, section_content, wikitables = sections[section_order]
-                        c.execute('INSERT INTO article_sections (article_id, section_order, section_title, section_content, wikitables, embedding) VALUES (?, ?, ?, ?, ?, ?)', 
-                                  (article_id, section_order, section_title, section_content, wikitables, embedding_blob))
+                        print(f"\nVacuuming the database after {count} entries...")
+                        conn.execute('VACUUM;')
+                        print("Vacuum completed.")
+                        
+                        conn.close()
+                        
+                        db_index += 1
+                        conn, db_path = get_connection(db_index)
+                        c = conn.cursor()
+                        comparison = get_db_size(db_path) / float(db_splinter_size * 1024 * 1024 * 1024)
 
-                    for category in categories:
-                        category_id = get_category_id(category, c)
-                        c.execute('INSERT INTO article_categories (article_id, category_id) VALUES (?, ?)', 
-                                  (article_id, category_id))
-                except UnicodeEncodeError as e:
-                    print(f"UnicodeEncodeError: {e} - Skipping page ID {page.id} with title {title}")
-                    continue
-                count += 1
-                # Print the count with carriage return and commit every 100 pages
-                if count % 100 == 0:
-                    current_time = time.time()
-                    elapsed_time = current_time - start_time
-                    pages_per_second = count / elapsed_time
-                    
+                    try:
+                        c.execute('INSERT INTO articles (article_id, title, is_redirect, type) VALUES (?, ?, ?, ?)', 
+                                (page.id, title, is_redirect, type_))
+                        article_id = c.lastrowid
 
-                    percentage_complete = (page.id / total_pages) * 100
-                    print(f'\rImported {count} pages so far, {pages_per_second:.2f} pages per second, {percentage_complete:.2f}% complete')
-                    
-                    # Update previous time and count for the next derivative calculation
-                    prev_time = current_time
-                    prev_count = count
-                    
-                    save_checkpoint(page.id, conn, c)
-                    conn.commit()
+                        # Insert sections
+                        sections = parse_sections(parsed_content, is_redirect)
+                        
+                        # Create blank embedding variable with identity matrix, process this later
+                        blank_embedding = np.identity(n=3, dtype=np.float32)
+                        embedding_blob = blank_embedding.tobytes()
+                        
+                        for section_order in range(len(sections)):
+                            section_title, section_content, wikitables = sections[section_order]
+                            c.execute('INSERT INTO article_sections (article_id, section_order, section_title, section_content, wikitables, embedding) VALUES (?, ?, ?, ?, ?, ?)', 
+                                    (article_id, section_order, section_title, section_content, wikitables, embedding_blob))
 
-                
-                # Print a page title and the first 500 characters of its content every 1000 pages
-                if count % 1000 == 0:
-                    print(f'\nPage {count}: {title}')
-                    print(''.join(parsed_content[:500]))
+                        for category in categories:
+                            category_id = get_category_id(category, c)
+                            c.execute('INSERT INTO article_categories (article_id, category_id) VALUES (?, ?)', 
+                                    (article_id, category_id))
+                    except UnicodeEncodeError as e:
+                        print(f"UnicodeEncodeError: {e} - Skipping page ID {page.id} with title {title}")
+                        continue
+                    count += 1
+                    # Print the count with carriage return and commit every 100 pages
+                    if count % 100 == 0:
+                        current_time = time.time()
+                        elapsed_time = current_time - start_time
+                        pages_per_second = count / elapsed_time
+                        
+                        # Monitor memory usage
+                        process = psutil.Process(os.getpid())
+                        memory_info = process.memory_info()
+                        mem_mb = memory_info.rss / (1024 ** 2)
+
+                        percentage_complete = (page.id / total_pages) * 100
+                        print(" "*len(_printing_text),
+                            end="\r")
+
+                        _printing_text = f'Imported {count} pages so far, {pages_per_second:.2f} pages per second, {percentage_complete:.2f}% complete; Memory usage: {mem_mb:.2f} MB'
+                        
+                        print(_printing_text,
+                            end="\r")
+                        
+                        # Update previous time and count for the next derivative calculation
+                        prev_time = current_time
+                        prev_count = count
+                        
+                        save_checkpoint(page.id, conn, c)
+                        conn.commit()
+                        
+
+
+
+                    # Print a page title and the first 500 characters of its content every 1000 pages
+                    if count % 1000 == 0:
+                        print(f'\nPage {count}: {title}')
+                        print(''.join(parsed_content[:500]))
+
+                    if count % 10000 == 0:
+                        with open("db_files/import_log.csv","a",newline="") as fi:
+                            writer = csv.writer(fi)
+                            writer.writerow(
+                                [count, pages_per_second, percentage_complete, psutil.virtual_memory().percent]
+                            )
+                        print("Running GC cleaning.")
+                        gc.collect()
+                    
+                    if count % 250000 == 0:
+                        print("Early return to reset Memory usage!")
+                        return False
+                    
     save_checkpoint(page.id, conn, c)
     conn.commit()
     conn.close()
+    gc.collect()
+    return True
 
 def validate_checkpoint(file_path):
     """
@@ -361,10 +404,12 @@ if __name__ == "__main__":
     file_path = args.file_path
     output_path = file_path.replace(".xml", "_pageCount.json")
 
+
+    # The code is meant to exit after 200,000 entries (or whatever the last count % conditional is)
     counter_(input_file_path=file_path, output_json_path=output_path)
 
     # Import pages
-    parse_dump(file_path=file_path, total_pages_file=output_path, db_splinter_size=int(args.db_splinter_size))
+    isDone = parse_dump(file_path=file_path, total_pages_file=output_path, db_splinter_size=int(args.db_splinter_size))
 
     # Validate checkpoint
     validate_checkpoint(file_path)
